@@ -22,7 +22,7 @@ style.textContent = `
 `;
 document.head.appendChild(style);
 
-const VALID_TAGS = new Set(["P", "LI", "BLOCKQUOTE", "SPAN", "A", "TD", "TH", "ARTICLE"]);
+const VALID_TAGS = new Set(["P", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "SPAN", "A", "TD", "TH", "ARTICLE"]);
 
 function isValidTextElement(el: HTMLElement): boolean {
   if (!el || !el.tagName) return false;
@@ -37,7 +37,7 @@ function isValidTextElement(el: HTMLElement): boolean {
   }
 
   const text = el.innerText || el.textContent || "";
-  if (text.trim().length < 15) return false;
+  if (text.trim().length < 2) return false;
   const rect = el.getBoundingClientRect();
   if (rect.height > 600) return false;
   return true;
@@ -55,6 +55,28 @@ function getClosestValidElement(el: HTMLElement | null): HTMLElement | null {
     current = current.parentElement;
   }
   return highestValid;
+}
+
+function getNextValidElement(current: HTMLElement): HTMLElement | null {
+  let node: Node | null = current;
+  function getNextNode(n: Node): Node | null {
+    if (n !== current && n.firstChild) return n.firstChild;
+    while (n) {
+      if (n.nextSibling) return n.nextSibling;
+      n = n.parentNode as Node;
+    }
+    return null;
+  }
+
+  while ((node = getNextNode(node))) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement;
+      if (isValidTextElement(el)) {
+        return el;
+      }
+    }
+  }
+  return null;
 }
 
 function createRangeFromOffset(el: HTMLElement, start: number, length: number): Range | null {
@@ -144,7 +166,13 @@ function syncPosition() {
   playButton.style.left = `${left}px`;
 }
 
+let currentHighlightTick: any = null;
+
 function clearHighlight() {
+  if (currentHighlightTick) {
+    clearInterval(currentHighlightTick);
+    currentHighlightTick = null;
+  }
   if ('highlights' in CSS) {
     (CSS as any).highlights.delete(activeHighlightName);
   }
@@ -215,10 +243,70 @@ document.addEventListener("mousemove", (e) => {
     }
   }
 });
+function base64ToUint8Array(base64: string) {
+  const binary_string = window.atob(base64);
+  const len = binary_string.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary_string.charCodeAt(i);
+  }
+  return bytes;
+}
 
-playButton.onclick = async (e) => {
-  e.stopPropagation();
-  e.preventDefault();
+interface PreloadSession {
+  text: string;
+  port: chrome.runtime.Port;
+  chunks: Uint8Array[];
+  wordBoundaries: any[];
+  isFinished: boolean;
+  listener: (msg: any) => void;
+  error?: string;
+}
+
+let activePreload: PreloadSession | null = null;
+
+function startPreload(text: string, voice: string, rateString: string) {
+  if (activePreload && activePreload.text === text) return;
+  if (activePreload) {
+    activePreload.port.disconnect();
+    activePreload = null;
+  }
+  
+  const port = chrome.runtime.connect({ name: "tts-stream" });
+  const session: PreloadSession = {
+    text, port, chunks: [], wordBoundaries: [], isFinished: false, listener: () => {}
+  };
+  activePreload = session;
+  
+  const listener = (msg: any) => {
+    if (msg.type === "audio") {
+      session.chunks.push(base64ToUint8Array(msg.data));
+    } else if (msg.type === "WordBoundary") {
+      if (msg.offset !== undefined) {
+         const audioOffsetMs = msg.offset / 10000;
+         const durationMs = msg.duration / 10000;
+         const wordStr = msg.textObj || "";
+         if (wordStr.length > 0) {
+           session.wordBoundaries.push({ audioOffsetMs, durationMs, wordStr });
+         }
+      }
+    } else if (msg.type === "end") {
+      session.isFinished = true;
+    } else if (msg.type === "error") {
+      session.error = msg.error;
+      session.isFinished = true;
+    }
+  };
+  session.listener = listener;
+  port.onMessage.addListener(listener);
+  port.postMessage({ type: "START", text, voice, rateString });
+}
+
+playButton.onclick = async (e: any) => {
+  if (e) {
+    if (e.stopPropagation) e.stopPropagation();
+    if (e.preventDefault) e.preventDefault();
+  }
 
   if (isPlaying && audioRef) {
     audioRef.pause();
@@ -294,6 +382,10 @@ playButton.onclick = async (e) => {
             sourceBuffer?.appendBuffer(queue.shift()!);
           }
         });
+
+        if (queue.length > 0 && !sourceBuffer.updating) {
+          sourceBuffer.appendBuffer(queue.shift()!);
+        }
       });
 
       audioRef.onended = () => {
@@ -302,16 +394,37 @@ playButton.onclick = async (e) => {
         playButton.innerHTML = PLAY_SVG;
         playButton.style.background = "#2563eb";
         
-        if (!playButton.matches(":hover")) {
-          playButton.style.opacity = "0";
-          playButton.style.pointerEvents = "none";
-          currentTarget = null;
+        const nextEl = getNextValidElement(currentTarget!);
+        if (nextEl) {
+          currentTarget = nextEl;
+          currentTextNode = null;
+          const walker = document.createTreeWalker(currentTarget, NodeFilter.SHOW_TEXT, null);
+          let node: Node | null;
+          while ((node = walker.nextNode())) {
+            if (node.textContent && node.textContent.trim().length > 0) {
+              currentTextNode = node;
+              break;
+            }
+          }
+          syncPosition();
+          setTimeout(() => {
+            if (playButton.onclick) {
+              playButton.onclick(null as any);
+            }
+          }, 100);
+        } else {
+          if (!playButton.matches(":hover")) {
+            playButton.style.opacity = "0";
+            playButton.style.pointerEvents = "none";
+            currentTarget = null;
+          }
         }
       };
 
       let lastHighlightedWord: any = null;
 
-      const highlightTick = setInterval(() => {
+      if (currentHighlightTick) clearInterval(currentHighlightTick);
+      currentHighlightTick = setInterval(() => {
         if (!isPlaying || !audioRef) return;
         const currentTimeMs = audioRef.currentTime * 1000;
         
@@ -336,18 +449,74 @@ playButton.onclick = async (e) => {
         }
       }, 50);
 
-function base64ToUint8Array(base64: string) {
-  const binary_string = window.atob(base64);
-  const len = binary_string.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binary_string.charCodeAt(i);
-  }
-  return bytes;
-}
 
-      // Open connection to background script to bypass CSP
-      const port = chrome.runtime.connect({ name: "tts-stream" });
+      function tryEndStream() {
+        if (!mediaSource) return;
+        if (mediaSource.readyState === 'open') {
+          if (sourceBuffer && sourceBuffer.updating) {
+            sourceBuffer.addEventListener('updateend', tryEndStream, { once: true });
+          } else if (queue.length > 0) {
+            sourceBuffer?.addEventListener('updateend', tryEndStream, { once: true });
+          } else {
+            try {
+              mediaSource.endOfStream();
+            } catch (e) {
+              console.error("endOfStream error", e);
+            }
+          }
+        } else {
+          mediaSource.addEventListener('sourceopen', tryEndStream, { once: true });
+        }
+      }
+
+      let port: chrome.runtime.Port;
+      let preloadedSession = (activePreload && activePreload.text === fullTextToRead) ? activePreload : null;
+      
+      if (preloadedSession) {
+        port = preloadedSession.port;
+        port.onMessage.removeListener(preloadedSession.listener);
+        
+        if (preloadedSession.error) {
+          isLoading = false;
+          playButton.innerHTML = PLAY_SVG;
+          playButton.style.background = "#2563eb";
+          console.error("TTS generation failed during preload:", preloadedSession.error);
+          return;
+        }
+
+        if (preloadedSession.chunks.length > 0) {
+          isFirstChunk = false;
+          isLoading = false;
+          isPlaying = true;
+          playButton.innerHTML = PAUSE_SVG;
+          playButton.style.background = "#ef4444"; 
+        }
+
+        for (const chunk of preloadedSession.chunks) {
+          queue.push(chunk);
+        }
+        for (const wb of preloadedSession.wordBoundaries) {
+          const charOffset = fullTextToRead.indexOf(wb.wordStr, lastCharOffset);
+          if (charOffset !== -1) {
+            const charLength = wb.wordStr.length;
+            lastCharOffset = charOffset + charLength;
+            wordBoundaries.push({ audioOffsetMs: wb.audioOffsetMs, durationMs: wb.durationMs, charOffset, charLength });
+          }
+        }
+        
+        if (preloadedSession.isFinished) {
+          tryEndStream();
+        }
+        activePreload = null;
+      } else {
+        port = chrome.runtime.connect({ name: "tts-stream" });
+        port.postMessage({
+          type: "START",
+          text: fullTextToRead,
+          voice,
+          rateString
+        });
+      }
       
       port.onMessage.addListener((msg) => {
         if (!isLoading && !isPlaying) {
@@ -387,24 +556,27 @@ function base64ToUint8Array(base64: string) {
              }
           }
         } else if (msg.type === "end") {
-          if (mediaSource && mediaSource.readyState === 'open') {
-            mediaSource.endOfStream();
-          }
+          tryEndStream();
         } else if (msg.type === "error") {
           console.error("Stream error from background:", msg.error);
         }
       });
 
       port.onDisconnect.addListener(() => {
-        clearInterval(highlightTick);
+        if (currentHighlightTick) {
+          clearInterval(currentHighlightTick);
+          currentHighlightTick = null;
+        }
       });
 
-      port.postMessage({
-        type: "START",
-        text: fullTextToRead,
-        voice,
-        rateString
-      });
+      // Start preloading the next chunk
+      const nextEl = getNextValidElement(currentTarget!);
+      if (nextEl) {
+        const nextText = extractRawText(nextEl);
+        if (nextText.trim()) {
+           startPreload(nextText, voice, rateString);
+        }
+      }
 
     });
   } catch (error) {
