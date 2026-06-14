@@ -217,6 +217,14 @@ function stopSession() {
   if (audioRef) {
      audioRef.pause();
   }
+  if (activePort) {
+     activePort.disconnect();
+     activePort = null;
+  }
+  if (activePreload) {
+     activePreload.port.disconnect();
+     activePreload = null;
+  }
   isPlaying = false;
   isLoading = false;
   activeTarget = null;
@@ -272,6 +280,7 @@ function updatePlayButtonAppearance() {
 }
 
 let activeTarget: HTMLElement | null = null;
+let activePort: chrome.runtime.Port | null = null;
 let currentHighlightTick: any = null;
 let activeFullText = "";
 let activeWordBoundaries: any[] = [];
@@ -557,6 +566,10 @@ playButton.onclick = async (e: any) => {
       audioRef.pause();
       isPlaying = false;
       clearHighlight(true);
+      if (activePort) {
+        activePort.disconnect();
+        activePort = null;
+      }
     }
   }
 
@@ -696,18 +709,15 @@ playButton.onclick = async (e: any) => {
         }
       }
 
-      let port: chrome.runtime.Port;
       let preloadedSession = (activePreload && activePreload.text === fullTextToRead) ? activePreload : null;
       
       if (preloadedSession) {
-        port = preloadedSession.port;
-        port.onMessage.removeListener(preloadedSession.listener);
+        activePort = preloadedSession.port;
+        activePort.onMessage.removeListener(preloadedSession.listener);
         
         if (preloadedSession.error) {
-          isLoading = false;
-          playButton.innerHTML = PLAY_SVG;
-          playButton.style.background = "#2563eb";
           console.error("TTS generation failed during preload:", preloadedSession.error);
+          stopSession();
           return;
         }
 
@@ -741,8 +751,8 @@ playButton.onclick = async (e: any) => {
         }
         activePreload = null;
       } else {
-        port = chrome.runtime.connect({ name: "tts-stream" });
-        port.postMessage({
+        activePort = chrome.runtime.connect({ name: "tts-stream" });
+        activePort.postMessage({
           type: "START",
           text: fullTextToRead,
           voice,
@@ -750,9 +760,10 @@ playButton.onclick = async (e: any) => {
         });
       }
       
-      port.onMessage.addListener((msg) => {
+      activePort.onMessage.addListener((msg) => {
         if (!isLoading && !isPlaying) {
-           port.disconnect();
+           activePort?.disconnect();
+           activePort = null;
            return;
         }
 
@@ -795,10 +806,11 @@ playButton.onclick = async (e: any) => {
           tryEndStream();
         } else if (msg.type === "error") {
           console.error("Stream error from background:", msg.error);
+          stopSession();
         }
       });
 
-      port.onDisconnect.addListener(() => {
+      activePort.onDisconnect.addListener(() => {
         if (currentHighlightTick) {
           clearInterval(currentHighlightTick);
           currentHighlightTick = null;
