@@ -83,6 +83,21 @@ function getNextValidElement(current: HTMLElement): HTMLElement | null {
   return null;
 }
 
+function extractRawText(el: HTMLElement): string {
+  let text = "";
+  function traverse(node: Node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      text += node.textContent || "";
+    } else {
+      for (const child of Array.from(node.childNodes)) {
+        traverse(child);
+      }
+    }
+  }
+  traverse(el);
+  return text;
+}
+
 function createRangeFromOffset(el: HTMLElement, start: number, length: number): Range | null {
   const range = document.createRange();
   let currentOffset = 0;
@@ -170,6 +185,17 @@ function syncPosition() {
   playButton.style.left = `${left}px`;
 }
 
+function updatePlayButtonAppearance() {
+  if (isLoading) return;
+  if (isPlaying && currentTarget === activeTarget && activeTarget !== null) {
+    playButton.innerHTML = PAUSE_SVG;
+    playButton.style.background = "#ef4444";
+  } else {
+    playButton.innerHTML = PLAY_SVG;
+    playButton.style.background = "#2563eb";
+  }
+}
+
 let activeTarget: HTMLElement | null = null;
 let currentHighlightTick: any = null;
 let activeFullText = "";
@@ -177,7 +203,9 @@ let activeWordBoundaries: any[] = [];
 let hoveredAudioOffset: number | null = null;
 let lastSentenceStart = -1;
 const sentenceHighlightName = "aura-sentence-hover";
-
+let hoveredValidEl: HTMLElement | null = null;
+let hoveredSentenceStart = 0;
+let pendingSeekCharOffset: number | null = null;
 function clearHighlight(stopTimer = true) {
   if (stopTimer && currentHighlightTick) {
     clearInterval(currentHighlightTick);
@@ -188,15 +216,17 @@ function clearHighlight(stopTimer = true) {
   }
 }
 
-function handleSentenceHover(e: MouseEvent) {
-  if (!activeTarget || !activeTarget.contains(e.target as Node)) {
-     if ('highlights' in CSS) (CSS as any).highlights.delete(sentenceHighlightName);
-     hoveredAudioOffset = null;
-     lastSentenceStart = -1;
-     activeTarget && (activeTarget.style.cursor = "");
-     return;
+function clearSentenceHover() {
+  if ('highlights' in CSS) (CSS as any).highlights.delete(sentenceHighlightName);
+  hoveredAudioOffset = null;
+  lastSentenceStart = -1;
+  if (hoveredValidEl) {
+     hoveredValidEl.style.cursor = "";
+     hoveredValidEl = null;
   }
+}
 
+function handleSentenceHover(e: MouseEvent, validEl: HTMLElement) {
   const range = (document as any).caretRangeFromPoint(e.clientX, e.clientY);
   if (!range) return;
 
@@ -222,10 +252,10 @@ function handleSentenceHover(e: MouseEvent) {
       }
     }
   }
-  traverse(activeTarget);
+  traverse(validEl);
   if (!found) return;
 
-  const text = activeFullText;
+  const text = (validEl === activeTarget) ? activeFullText : extractRawText(validEl);
   let sentenceStart = 0;
   let sentenceEnd = text.length;
 
@@ -252,20 +282,30 @@ function handleSentenceHover(e: MouseEvent) {
      }
   }
 
-  if (sentenceStart === lastSentenceStart) return;
+  if (sentenceStart === lastSentenceStart && hoveredValidEl === validEl) return;
   lastSentenceStart = sentenceStart;
+  
+  if (hoveredValidEl && hoveredValidEl !== validEl) {
+     hoveredValidEl.style.cursor = "";
+  }
+  hoveredValidEl = validEl;
 
   if (sentenceEnd > sentenceStart) {
-      const highlightRange = createRangeFromOffset(activeTarget, sentenceStart, sentenceEnd - sentenceStart);
+      const highlightRange = createRangeFromOffset(validEl, sentenceStart, sentenceEnd - sentenceStart);
       if (highlightRange && 'highlights' in CSS) {
          const highlight = new (window as any).Highlight(highlightRange);
          (CSS as any).highlights.set(sentenceHighlightName, highlight);
-         activeTarget.style.cursor = "pointer";
+         validEl.style.cursor = "pointer";
       }
       
-      const firstWord = activeWordBoundaries.find(w => w.charOffset >= sentenceStart);
-      if (firstWord) {
-         hoveredAudioOffset = firstWord.audioOffsetMs;
+      hoveredSentenceStart = sentenceStart;
+      if (validEl === activeTarget && isPlaying) {
+         const firstWord = activeWordBoundaries.find(w => w.charOffset >= sentenceStart);
+         if (firstWord) {
+            hoveredAudioOffset = firstWord.audioOffsetMs;
+         } else {
+            hoveredAudioOffset = null;
+         }
       } else {
          hoveredAudioOffset = null;
       }
@@ -273,37 +313,47 @@ function handleSentenceHover(e: MouseEvent) {
 }
 
 document.addEventListener("click", (e) => {
-  if (isPlaying && hoveredAudioOffset !== null && audioRef) {
+  const target = e.target as HTMLElement;
+  if (target === playButton || playButton.contains(target)) return;
+
+  if (hoveredValidEl) {
      e.preventDefault();
      e.stopPropagation();
-     audioRef.currentTime = hoveredAudioOffset / 1000;
+
+     if (hoveredValidEl === activeTarget && isPlaying && hoveredAudioOffset !== null && audioRef) {
+        audioRef.currentTime = hoveredAudioOffset / 1000;
+     } else {
+        pendingSeekCharOffset = hoveredSentenceStart;
+        currentTarget = hoveredValidEl;
+        if (playButton.onclick) {
+           playButton.onclick(null as any);
+        }
+     }
   }
 }, true);
 
 document.addEventListener("mousemove", (e) => {
-  if (isPlaying) {
-    handleSentenceHover(e);
-    return;
-  }
   if (isLoading) return;
 
   const target = e.target as HTMLElement;
+  const validEl = getClosestValidElement(target);
   
   if (target === playButton || playButton.contains(target)) {
     if (hoverTimer) {
       clearTimeout(hoverTimer);
       hoverTimer = null;
     }
+    clearSentenceHover();
     return;
   }
-
-  const validEl = getClosestValidElement(target);
 
   if (validEl) {
     if (hoverTimer) {
       clearTimeout(hoverTimer);
       hoverTimer = null;
     }
+    
+    handleSentenceHover(e, validEl);
     
     if (currentTarget !== validEl) {
       // Prevent jumping to an ancestor container when traversing padding
@@ -327,12 +377,14 @@ document.addEventListener("mousemove", (e) => {
         if (!syncInterval) {
           syncInterval = setInterval(syncPosition, 50); 
         }
+        updatePlayButtonAppearance();
       }
     }
     
     playButton.style.opacity = "1";
     playButton.style.pointerEvents = "auto";
   } else {
+    clearSentenceHover();
     if (!hoverTimer) {
       hoverTimer = setTimeout(() => {
         if (!isPlaying && !isLoading) {
@@ -415,12 +467,18 @@ playButton.onclick = async (e: any) => {
   }
 
   if (isPlaying && audioRef) {
-    audioRef.pause();
-    isPlaying = false;
-    clearHighlight(false);
-    playButton.innerHTML = PLAY_SVG;
-    playButton.style.background = "#2563eb";
-    return;
+    if (currentTarget === activeTarget) {
+      audioRef.pause();
+      isPlaying = false;
+      clearHighlight(false);
+      playButton.innerHTML = PLAY_SVG;
+      playButton.style.background = "#2563eb";
+      return;
+    } else {
+      audioRef.pause();
+      isPlaying = false;
+      clearHighlight(true);
+    }
   }
 
   if (!isPlaying && audioRef && currentTarget === activeTarget && activeTarget !== null) {
@@ -432,21 +490,6 @@ playButton.onclick = async (e: any) => {
   }
 
   if (isLoading || !currentTarget) return;
-
-  function extractRawText(el: HTMLElement): string {
-    let text = "";
-    function traverse(node: Node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        text += node.textContent || "";
-      } else {
-        for (const child of Array.from(node.childNodes)) {
-          traverse(child);
-        }
-      }
-    }
-    traverse(el);
-    return text;
-  }
 
   const fullTextToRead = extractRawText(currentTarget);
   if (!fullTextToRead || !fullTextToRead.trim()) return;
@@ -541,10 +584,10 @@ playButton.onclick = async (e: any) => {
           currentTimeMs <= (w.audioOffsetMs + w.durationMs)
         );
 
-        if (currentWord && currentTarget && 'highlights' in CSS) {
+        if (currentWord && activeTarget && 'highlights' in CSS) {
           if (currentWord !== lastHighlightedWord) {
             lastHighlightedWord = currentWord;
-            const range = createRangeFromOffset(currentTarget, currentWord.charOffset, currentWord.charLength);
+            const range = createRangeFromOffset(activeTarget, currentWord.charOffset, currentWord.charLength);
             if (range) {
               const highlight = new (window as any).Highlight(range);
               (CSS as any).highlights.set(activeHighlightName, highlight);
@@ -609,6 +652,11 @@ playButton.onclick = async (e: any) => {
             const charLength = wb.wordStr.length;
             lastCharOffset = charOffset + charLength;
             activeWordBoundaries.push({ audioOffsetMs: wb.audioOffsetMs, durationMs: wb.durationMs, charOffset, charLength });
+            
+            if (pendingSeekCharOffset !== null && charOffset >= pendingSeekCharOffset && audioRef) {
+               audioRef.currentTime = wb.audioOffsetMs / 1000;
+               pendingSeekCharOffset = null;
+            }
           }
         }
         
@@ -653,15 +701,19 @@ playButton.onclick = async (e: any) => {
              const audioOffsetMs = msg.offset / 10000;
              const durationMs = msg.duration / 10000;
              const wordStr = msg.textObj || "";
-             
              if (wordStr.length > 0) {
-               const charOffset = fullTextToRead.indexOf(wordStr, lastCharOffset);
-               if (charOffset !== -1) {
-                 const charLength = wordStr.length;
-                 lastCharOffset = charOffset + charLength;
-                 activeWordBoundaries.push({ audioOffsetMs, durationMs, charOffset, charLength });
-               }
-             }
+                const charOffset = fullTextToRead.indexOf(wordStr, lastCharOffset);
+                if (charOffset !== -1) {
+                  const charLength = wordStr.length;
+                  lastCharOffset = charOffset + charLength;
+                  activeWordBoundaries.push({ audioOffsetMs, durationMs, charOffset, charLength });
+                  
+                  if (pendingSeekCharOffset !== null && charOffset >= pendingSeekCharOffset && audioRef) {
+                     audioRef.currentTime = audioOffsetMs / 1000;
+                     pendingSeekCharOffset = null;
+                  }
+                }
+              }
           }
         } else if (msg.type === "end") {
           tryEndStream();
