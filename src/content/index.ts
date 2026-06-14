@@ -26,11 +26,33 @@ style.textContent = `
 `;
 document.head.appendChild(style);
 
-const VALID_TAGS = new Set(["P", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "SPAN", "A", "TD", "TH", "ARTICLE", "DIV"]);
+const VALID_TAGS = new Set(["P", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "SPAN", "A", "TD", "TH", "ARTICLE", "DIV", "FIGCAPTION"]);
 
 function isValidTextElement(el: HTMLElement): boolean {
   if (!el || !el.tagName) return false;
   if (!VALID_TAGS.has(el.tagName)) return false;
+
+  const role = el.getAttribute("role");
+  if (role && ["button", "menuitem", "tab", "dialog", "navigation", "search", "switch", "checkbox", "radio", "option"].includes(role)) return false;
+
+  let depth = 0;
+  let currentEl: HTMLElement | null = el;
+  const uiClasses = ["btn", "button", "dropdown", "menu", "nav", "tab", "pill", "badge", "tag", "filter", "pagination", "controls", "profile", "avatar", "author", "metadata"];
+  while (currentEl && currentEl !== document.body && currentEl !== document.documentElement && depth < 4) {
+    const classes = currentEl.classList;
+    for (let i = 0; i < classes.length; i++) {
+      const cls = classes[i].toLowerCase();
+      if (uiClasses.some(ui => cls === ui || cls.includes(`-${ui}`) || cls.includes(`${ui}-`))) {
+        return false;
+      }
+    }
+    currentEl = currentEl.parentElement;
+    depth++;
+  }
+
+  if (el.closest("nav, footer, aside, menu, form, button, [role='navigation'], [role='menu'], [role='tablist'], [role='search'], [role='toolbar'], [role='menubar'], [role='dialog'], [role='button'], [role='tab']")) {
+    return false;
+  }
   
   if (el.tagName === "DIV") {
     const hasBlockChildren = Array.from(el.children).some(child => {
@@ -41,9 +63,45 @@ function isValidTextElement(el: HTMLElement): boolean {
   }
 
   const text = el.innerText || el.textContent || "";
-  if (text.trim().length === 0) return false;
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return false;
+
   const rect = el.getBoundingClientRect();
   if (rect.height > 600) return false;
+
+  const wordCount = trimmed.split(/\s+/).length;
+  if (!["H1", "H2", "H3", "H4", "H5", "H6"].includes(el.tagName)) {
+    if (wordCount <= 5) {
+      const hasPunctuation = /[.!?:]/.test(trimmed);
+      if (!hasPunctuation) return false;
+    }
+    if (rect.height > 150 && wordCount < 15) {
+      return false;
+    }
+  }
+  
+  if (["DIV", "SPAN", "ARTICLE", "SECTION", "LI"].includes(el.tagName)) {
+    const interactiveElements = Array.from(el.querySelectorAll("a, button"));
+    let interactiveTextLength = 0;
+    for (const child of interactiveElements) {
+      interactiveTextLength += (child.innerText || child.textContent || "").length;
+    }
+    if (interactiveTextLength > 0 && interactiveTextLength >= trimmed.length * 0.5) {
+      return false;
+    }
+  }
+
+  const mediaElements = Array.from(el.querySelectorAll("img, video, svg"));
+  let totalMediaArea = 0;
+  for (const media of mediaElements) {
+    const mediaRect = media.getBoundingClientRect();
+    totalMediaArea += mediaRect.width * mediaRect.height;
+  }
+  const elArea = rect.width * rect.height;
+  if (elArea > 0 && totalMediaArea > elArea * 0.5) {
+    return false;
+  }
+
   return true;
 }
 
@@ -605,14 +663,16 @@ function startPreload(text: string, voice: string, rateString: string) {
   port.postMessage({ type: "START", text, voice, rateString });
 }
 
-playButton.onclick = async (e: any) => {
+playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
   if (e) {
     if (e.stopPropagation) e.stopPropagation();
     if (e.preventDefault) e.preventDefault();
   }
 
+  const targetToPlay = forceTarget || currentTarget;
+
   if (isPlaying && audioRef) {
-    if (currentTarget === activeTarget) {
+    if (targetToPlay === activeTarget) {
       audioRef.pause();
       setPlaying(false);
       clearHighlight(false);
@@ -630,7 +690,7 @@ playButton.onclick = async (e: any) => {
     }
   }
 
-  if (!isPlaying && audioRef && currentTarget === activeTarget && activeTarget !== null) {
+  if (!isPlaying && audioRef && targetToPlay === activeTarget && activeTarget !== null) {
     audioRef.play().catch(e => console.error("Resume failed", e));
     setPlaying(true);
     playButton.innerHTML = PAUSE_SVG;
@@ -638,13 +698,13 @@ playButton.onclick = async (e: any) => {
     return;
   }
 
-  if (isLoading || !currentTarget) return;
+  if (isLoading || !targetToPlay) return;
 
-  const fullTextToRead = extractRawText(currentTarget);
+  const fullTextToRead = extractRawText(targetToPlay);
   if (!fullTextToRead || !fullTextToRead.trim()) return;
 
   isLoading = true;
-  activeTarget = currentTarget;
+  activeTarget = targetToPlay;
   startSession();
   playButton.innerHTML = LOAD_SVG;
   playButton.children[0].animate([{transform: 'rotate(0deg)'}, {transform: 'rotate(360deg)'}], {duration: 1000, iterations: Infinity});
@@ -710,7 +770,7 @@ playButton.onclick = async (e: any) => {
           syncPosition();
           setTimeout(() => {
             if (playButton.onclick) {
-              playButton.onclick(null as any);
+              (playButton.onclick as any)(null, nextEl);
             }
           }, 100);
         } else {
