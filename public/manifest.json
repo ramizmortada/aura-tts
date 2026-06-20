@@ -5,7 +5,8 @@
   "description": "Premium text-to-speech extension using Edge voices.",
   "permissions": [
     "storage",
-    "nativeMessaging"
+    "nativeMessaging",
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"

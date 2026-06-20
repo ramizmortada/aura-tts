@@ -23,4 +23,9 @@ console.log('Building background script...');
 execSync('npx esbuild src/background/index.ts --bundle --outfile=out/background.js --format=esm --target=es2020 --platform=browser');
 console.log('Done in ' + (Date.now() - start) + 'ms');
 
+start = Date.now();
+console.log('Building offscreen script...');
+execSync('npx esbuild src/offscreen/index.ts --bundle --outfile=out/offscreen.js --format=iife --target=es2020 --platform=browser');
+console.log('Done in ' + (Date.now() - start) + 'ms');
+
 console.log("Build complete!");

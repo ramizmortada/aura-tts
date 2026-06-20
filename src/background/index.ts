@@ -1,20 +1,67 @@
+let creatingOffscreen: Promise<void> | null = null;
+
+async function setupOffscreenDocument() {
+  if (await chrome.offscreen.hasDocument()) return;
+  if (creatingOffscreen) {
+    await creatingOffscreen;
+    return;
+  }
+  creatingOffscreen = chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: [chrome.offscreen.Reason.AUDIO_PLAYBACK],
+    justification: "To play text-to-speech audio streams."
+  });
+  await creatingOffscreen;
+  creatingOffscreen = null;
+}
+
+let activeClientPort: chrome.runtime.Port | null = null;
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Forward offscreen playback events to the active content script port
+  if (msg.type === "PLAYBACK_ENDED" || msg.type === "TIME_UPDATE") {
+    if (activeClientPort) {
+      try {
+        activeClientPort.postMessage(msg);
+      } catch (e) {
+        // Port disconnected
+      }
+    }
+  }
+});
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "tts-stream") return;
 
   let nativePort: chrome.runtime.Port | null = null;
   let isActive = true;
+  let isSessionPort = false;
 
   port.onDisconnect.addListener(() => {
     isActive = false;
+    if (activeClientPort === port) {
+      activeClientPort = null;
+    }
+    // Only stop offscreen audio if this was the port that started a session
+    if (isSessionPort) {
+      chrome.runtime.sendMessage({ target: "offscreen", type: "STOP" }).catch(()=>{});
+    }
     if (nativePort) {
       nativePort.disconnect();
       nativePort = null;
     }
   });
 
-  port.onMessage.addListener((msg) => {
+  port.onMessage.addListener(async (msg) => {
     if (msg.type === "START") {
+      // This port is now the active session port
+      isSessionPort = true;
+      activeClientPort = port;
+
       try {
+        await setupOffscreenDocument();
+        chrome.runtime.sendMessage({ target: "offscreen", type: "INIT_AUDIO" }).catch(()=>{});
+
         // Connect to the native messaging host
         nativePort = chrome.runtime.connectNative("com.edgetts.host");
         
@@ -31,12 +78,7 @@ chrome.runtime.onConnect.addListener((port) => {
           if (!isActive) return;
 
           if (nativeMsg.type === "audio") {
-             // Array needs to be casted to Uint8Array when creating chunks in content script,
-             // so sending an Array is fine.
-             port.postMessage({
-               type: "audio",
-               data: nativeMsg.data
-             });
+             chrome.runtime.sendMessage({ target: "offscreen", type: "APPEND_AUDIO", data: nativeMsg.data }).catch(()=>{});
           } else if (nativeMsg.type === "WordBoundary") {
              port.postMessage({
                type: "WordBoundary",
@@ -46,9 +88,11 @@ chrome.runtime.onConnect.addListener((port) => {
              });
           } else if (nativeMsg.type === "end") {
              port.postMessage({ type: "end" });
+             chrome.runtime.sendMessage({ target: "offscreen", type: "END_STREAM" }).catch(()=>{});
              nativePort?.disconnect();
           } else if (nativeMsg.type === "error") {
              port.postMessage({ type: "error", error: nativeMsg.error });
+             chrome.runtime.sendMessage({ target: "offscreen", type: "STOP" }).catch(()=>{});
              nativePort?.disconnect();
           }
         });
@@ -66,6 +110,18 @@ chrome.runtime.onConnect.addListener((port) => {
           port.postMessage({ type: "error", error: error.message || error.toString() });
         }
       }
+    } else if (msg.type === "PLAY") {
+      chrome.runtime.sendMessage({ target: "offscreen", type: "PLAY" }).catch(()=>{});
+    } else if (msg.type === "PAUSE") {
+      chrome.runtime.sendMessage({ target: "offscreen", type: "PAUSE" }).catch(()=>{});
+    } else if (msg.type === "STOP") {
+      chrome.runtime.sendMessage({ target: "offscreen", type: "STOP" }).catch(()=>{});
+      if (nativePort) {
+        nativePort.disconnect();
+        nativePort = null;
+      }
+    } else if (msg.type === "SEEK") {
+      chrome.runtime.sendMessage({ target: "offscreen", type: "SEEK", offset: msg.offset }).catch(()=>{});
     }
   });
 });

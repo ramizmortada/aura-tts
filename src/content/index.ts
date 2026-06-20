@@ -2,12 +2,10 @@ import { Communicate } from "edge-tts-universal/browser";
 
 let isPlaying = false;
 let isLoading = false;
-let audioRef: HTMLAudioElement | null = null;
+let currentAudioTime = 0;
 let currentTarget: HTMLElement | null = null;
 let hoverTimer: any = null;
 let syncInterval: any = null;
-let mediaSource: MediaSource | null = null;
-let sourceBuffer: SourceBuffer | null = null;
 let activeHighlightName = "edge-tts-highlight";
 let currentTextNode: Node | null = null;
 
@@ -70,7 +68,7 @@ function isValidTextElement(el: HTMLElement): boolean {
   if (rect.height > 600) return false;
 
   const wordCount = trimmed.split(/\s+/).length;
-  if (!["H1", "H2", "H3", "H4", "H5", "H6"].includes(el.tagName)) {
+  if (!["H1", "H2", "H3", "H4", "H5", "H6", "P", "LI", "BLOCKQUOTE", "TH", "TD"].includes(el.tagName)) {
     if (wordCount <= 5) {
       const hasPunctuation = /[.!?:]/.test(trimmed);
       if (!hasPunctuation) return false;
@@ -278,16 +276,16 @@ function setPlaying(val: boolean) {
 }
 
 globalPlayPauseButton.onclick = () => {
-  if (isPlaying && audioRef) {
-    audioRef.pause();
+  if (isPlaying && activePort) {
+    activePort.postMessage({ type: "PAUSE" });
     setPlaying(false);
     clearHighlight(false);
     if (currentTarget === activeTarget) {
       playButton.innerHTML = PLAY_SVG;
       playButton.style.background = "#2563eb";
     }
-  } else if (!isPlaying && audioRef && activeTarget !== null) {
-    audioRef.play().catch(e => console.error("Resume failed", e));
+  } else if (!isPlaying && activePort && activeTarget !== null) {
+    activePort.postMessage({ type: "PLAY" });
     setPlaying(true);
     if (currentTarget === activeTarget) {
       playButton.innerHTML = PAUSE_SVG;
@@ -324,16 +322,12 @@ floatingBar.appendChild(stopButton);
 document.body.appendChild(floatingBar);
 
 function stopSession() {
-  if (audioRef) {
-     audioRef.pause();
+  if (activePort) {
+     activePort.postMessage({ type: "STOP" });
   }
   if (activePort) {
      activePort.disconnect();
      activePort = null;
-  }
-  if (activePreload) {
-     activePreload.port.disconnect();
-     activePreload = null;
   }
   setPlaying(false);
   isLoading = false;
@@ -519,8 +513,8 @@ document.addEventListener("click", (e) => {
      e.preventDefault();
      e.stopPropagation();
 
-     if (hoveredValidEl === activeTarget && isPlaying && hoveredAudioOffset !== null && audioRef) {
-        audioRef.currentTime = hoveredAudioOffset / 1000;
+     if (hoveredValidEl === activeTarget && isPlaying && hoveredAudioOffset !== null && activePort) {
+        activePort.postMessage({ type: "SEEK", offset: hoveredAudioOffset / 1000 });
      } else {
         pendingSeekCharOffset = hoveredSentenceStart;
         currentTarget = hoveredValidEl;
@@ -604,66 +598,20 @@ document.addEventListener("mousemove", (e) => {
     }
   }
 });
-function base64ToUint8Array(base64: string) {
-  const binary_string = window.atob(base64);
-  const len = binary_string.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binary_string.charCodeAt(i);
+function isExtensionValid(): boolean {
+  try {
+    return !!(typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id);
+  } catch {
+    return false;
   }
-  return bytes;
-}
-
-interface PreloadSession {
-  text: string;
-  port: chrome.runtime.Port;
-  chunks: Uint8Array[];
-  wordBoundaries: any[];
-  isFinished: boolean;
-  listener: (msg: any) => void;
-  error?: string;
-}
-
-let activePreload: PreloadSession | null = null;
-
-function startPreload(text: string, voice: string, rateString: string) {
-  if (activePreload && activePreload.text === text) return;
-  if (activePreload) {
-    activePreload.port.disconnect();
-    activePreload = null;
-  }
-  
-  const port = chrome.runtime.connect({ name: "tts-stream" });
-  const session: PreloadSession = {
-    text, port, chunks: [], wordBoundaries: [], isFinished: false, listener: () => {}
-  };
-  activePreload = session;
-  
-  const listener = (msg: any) => {
-    if (msg.type === "audio") {
-      session.chunks.push(base64ToUint8Array(msg.data));
-    } else if (msg.type === "WordBoundary") {
-      if (msg.offset !== undefined) {
-         const audioOffsetMs = msg.offset / 10000;
-         const durationMs = msg.duration / 10000;
-         const wordStr = msg.textObj || "";
-         if (wordStr.length > 0) {
-           session.wordBoundaries.push({ audioOffsetMs, durationMs, wordStr });
-         }
-      }
-    } else if (msg.type === "end") {
-      session.isFinished = true;
-    } else if (msg.type === "error") {
-      session.error = msg.error;
-      session.isFinished = true;
-    }
-  };
-  session.listener = listener;
-  port.onMessage.addListener(listener);
-  port.postMessage({ type: "START", text, voice, rateString });
 }
 
 playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
+  if (!isExtensionValid()) {
+    alert("Aura TTS: The extension was updated or reloaded. Please refresh the page to continue.");
+    return;
+  }
+
   if (e) {
     if (e.stopPropagation) e.stopPropagation();
     if (e.preventDefault) e.preventDefault();
@@ -671,27 +619,29 @@ playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
 
   const targetToPlay = forceTarget || currentTarget;
 
-  if (isPlaying && audioRef) {
+  if (isPlaying) {
     if (targetToPlay === activeTarget) {
-      audioRef.pause();
+      if (activePort) activePort.postMessage({ type: "PAUSE" });
       setPlaying(false);
       clearHighlight(false);
       playButton.innerHTML = PLAY_SVG;
       playButton.style.background = "#2563eb";
       return;
     } else {
-      audioRef.pause();
-      setPlaying(false);
-      clearHighlight(true);
       if (activePort) {
+        activePort.postMessage({ type: "STOP" });
         activePort.disconnect();
         activePort = null;
       }
+      setPlaying(false);
+      clearHighlight(true);
     }
   }
 
-  if (!isPlaying && audioRef && targetToPlay === activeTarget && activeTarget !== null) {
-    audioRef.play().catch(e => console.error("Resume failed", e));
+  if (!isPlaying && targetToPlay === activeTarget && activeTarget !== null) {
+    if (activePort) {
+      activePort.postMessage({ type: "PLAY" });
+    }
     setPlaying(true);
     playButton.innerHTML = PAUSE_SVG;
     playButton.style.background = "#ef4444";
@@ -711,45 +661,21 @@ playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
   playButton.style.background = "#475569"; 
   clearHighlight();
 
+  currentAudioTime = 0;
+
   try {
     chrome.storage.local.get(["voice", "rate"], async (result) => {
+     try {
       const voice = (result.voice as string) || "en-US-AriaNeural";
       const rateArray = (result.rate as number[]) || [0];
       const rateString = rateArray[0] >= 0 ? `+${rateArray[0]}%` : `${rateArray[0]}%`;
 
-      if (!audioRef) {
-        audioRef = document.createElement("audio");
-        document.body.appendChild(audioRef);
-      }
-
-      mediaSource = new MediaSource();
-      audioRef.src = URL.createObjectURL(mediaSource);
-
-      audioRef.play().catch(e => console.error("Initial play failed", e));
-
       let isFirstChunk = true;
       activeWordBoundaries = [];
       activeFullText = fullTextToRead;
-      let sourceBuffer: SourceBuffer | null = null;
-      const queue: Uint8Array[] = [];
       let lastCharOffset = 0;
 
-      mediaSource.addEventListener('sourceopen', () => {
-        if (!mediaSource) return;
-        sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
-        
-        sourceBuffer.addEventListener('updateend', () => {
-          if (queue.length > 0 && !sourceBuffer?.updating) {
-            sourceBuffer?.appendBuffer(queue.shift()!);
-          }
-        });
-
-        if (queue.length > 0 && !sourceBuffer.updating) {
-          sourceBuffer.appendBuffer(queue.shift()!);
-        }
-      });
-
-      audioRef.onended = () => {
+      const handlePlaybackEnded = () => {
         setPlaying(false);
         clearHighlight();
         playButton.innerHTML = PLAY_SVG;
@@ -782,8 +708,8 @@ playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
 
       if (currentHighlightTick) clearInterval(currentHighlightTick);
       currentHighlightTick = setInterval(() => {
-        if (!isPlaying || !audioRef) return;
-        const currentTimeMs = audioRef.currentTime * 1000;
+        if (!isPlaying) return;
+        const currentTimeMs = currentAudioTime * 1000;
         
         const currentWord = activeWordBoundaries.find(w => 
           currentTimeMs >= w.audioOffsetMs && 
@@ -800,93 +726,33 @@ playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
             }
           }
         } else if (!currentWord && lastHighlightedWord && 'highlights' in CSS) {
-          // Clear highlight if we're between words
           lastHighlightedWord = null;
           (CSS as any).highlights.delete(activeHighlightName);
         }
       }, 50);
 
-
-      function tryEndStream() {
-        if (!mediaSource) return;
-        if (mediaSource.readyState === 'open') {
-          if (sourceBuffer && sourceBuffer.updating) {
-            sourceBuffer.addEventListener('updateend', tryEndStream, { once: true });
-          } else if (queue.length > 0) {
-            sourceBuffer?.addEventListener('updateend', tryEndStream, { once: true });
-          } else {
-            try {
-              mediaSource.endOfStream();
-            } catch (e) {
-              console.error("endOfStream error", e);
-            }
-          }
-        } else {
-          mediaSource.addEventListener('sourceopen', tryEndStream, { once: true });
-        }
+      if (!isExtensionValid()) {
+        stopSession();
+        alert("Aura TTS: The extension was updated or reloaded. Please refresh the page.");
+        return;
       }
+      activePort = chrome.runtime.connect({ name: "tts-stream" });
+      activePort.postMessage({
+        type: "START",
+        text: fullTextToRead,
+        voice,
+        rateString
+      });
 
-      let preloadedSession = (activePreload && activePreload.text === fullTextToRead) ? activePreload : null;
-      
-      if (preloadedSession) {
-        activePort = preloadedSession.port;
-        activePort.onMessage.removeListener(preloadedSession.listener);
-        
-        if (preloadedSession.error) {
-          console.error("TTS generation failed during preload:", preloadedSession.error);
-          stopSession();
-          return;
-        }
-
-        if (preloadedSession.chunks.length > 0) {
-          isFirstChunk = false;
-          isLoading = false;
-          setPlaying(true);
-          playButton.innerHTML = PAUSE_SVG;
-          playButton.style.background = "#ef4444"; 
-        }
-
-        for (const chunk of preloadedSession.chunks) {
-          queue.push(chunk);
-        }
-        for (const wb of preloadedSession.wordBoundaries) {
-          const charOffset = fullTextToRead.indexOf(wb.wordStr, lastCharOffset);
-          if (charOffset !== -1) {
-            const charLength = wb.wordStr.length;
-            lastCharOffset = charOffset + charLength;
-            activeWordBoundaries.push({ audioOffsetMs: wb.audioOffsetMs, durationMs: wb.durationMs, charOffset, charLength });
-            
-            if (pendingSeekCharOffset !== null && charOffset >= pendingSeekCharOffset && audioRef) {
-               audioRef.currentTime = wb.audioOffsetMs / 1000;
-               pendingSeekCharOffset = null;
-            }
-          }
-        }
-        
-        if (preloadedSession.isFinished) {
-          tryEndStream();
-        }
-        activePreload = null;
-      } else {
-        activePort = chrome.runtime.connect({ name: "tts-stream" });
-        activePort.postMessage({
-          type: "START",
-          text: fullTextToRead,
-          voice,
-          rateString
-        });
-      }
-      
       activePort.onMessage.addListener((msg) => {
         if (!isLoading && !isPlaying) {
-           activePort?.disconnect();
+           try { activePort?.disconnect(); } catch {}
            activePort = null;
            return;
         }
 
-        if (msg.type === "audio") {
-          const chunkData = base64ToUint8Array(msg.data);
-          
+        if (msg.type === "TIME_UPDATE") {
+          currentAudioTime = msg.currentTime;
           if (isFirstChunk) {
             isFirstChunk = false;
             isLoading = false;
@@ -894,12 +760,8 @@ playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
             playButton.innerHTML = PAUSE_SVG;
             playButton.style.background = "#ef4444"; 
           }
-          
-          if (sourceBuffer && !sourceBuffer.updating) {
-            sourceBuffer.appendBuffer(chunkData);
-          } else {
-            queue.push(chunkData);
-          }
+        } else if (msg.type === "PLAYBACK_ENDED") {
+          handlePlaybackEnded();
         } else if (msg.type === "WordBoundary") {
           if (msg.offset !== undefined) {
              const audioOffsetMs = msg.offset / 10000;
@@ -912,15 +774,15 @@ playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
                   lastCharOffset = charOffset + charLength;
                   activeWordBoundaries.push({ audioOffsetMs, durationMs, charOffset, charLength });
                   
-                  if (pendingSeekCharOffset !== null && charOffset >= pendingSeekCharOffset && audioRef) {
-                     audioRef.currentTime = audioOffsetMs / 1000;
+                  if (pendingSeekCharOffset !== null && charOffset >= pendingSeekCharOffset) {
+                     activePort?.postMessage({ type: "SEEK", offset: audioOffsetMs / 1000 });
                      pendingSeekCharOffset = null;
                   }
                 }
               }
           }
         } else if (msg.type === "end") {
-          tryEndStream();
+          // offscreen handles the actual media ending
         } else if (msg.type === "error") {
           console.error("Stream error from background:", msg.error);
           stopSession();
@@ -934,24 +796,13 @@ playButton.onclick = async (e: any, forceTarget?: HTMLElement) => {
         }
       });
 
-      // Start preloading the next chunk
-      const nextEl = getNextValidElement(currentTarget!);
-      if (nextEl) {
-        const nextText = extractRawText(nextEl);
-        if (nextText.trim()) {
-           startPreload(nextText, voice, rateString);
-        }
-      }
-
+     } catch (innerError) {
+       console.error("TTS generation failed (inner):", innerError);
+       stopSession();
+     }
     });
   } catch (error) {
     console.error("TTS generation failed:", error);
-    isLoading = false;
-    playButton.innerHTML = PLAY_SVG;
-    setTimeout(() => {
-      if (!isPlaying) {
-        playButton.style.background = "#2563eb";
-      }
-    }, 2000);
+    stopSession();
   }
 };
